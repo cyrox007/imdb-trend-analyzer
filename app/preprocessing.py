@@ -1,14 +1,17 @@
-# kinovanga/preprocessing.py
 import pandas as pd
-import numpy as np
 from sklearn.impute import SimpleImputer
 
-def create_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Создаёт признаки: ремейк, очистка, средний рейтинг режиссёра"""
+def create_features(df: pd.DataFrame, director_avg_map: dict = None) -> pd.DataFrame:
+    """
+    Создаёт признаки для модели.
+    :param df: исходный DataFrame
+    :param director_avg_map: словарь {режиссёр: средний рейтинг}
+    """
     df = df.copy()
 
     # Обработка пропусков
     df['primaryTitle'] = df['primaryTitle'].fillna('')
+    df['description'] = df['primaryTitle']  # Пока используем название как описание
     df['directors'] = df['directors'].fillna('Unknown')
 
     # Признак "ремейк"
@@ -24,8 +27,15 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     num_imputer = SimpleImputer(strategy='median')
     df[['runtimeMinutes', 'startYear']] = num_imputer.fit_transform(df[['runtimeMinutes', 'startYear']])
 
-    # Средний рейтинг режиссёра
-    director_avg = df.groupby('directors')['averageRating'].mean()
-    df['director_avg_rating'] = df['directors'].map(director_avg).fillna(df['averageRating'].mean())
+    # Добавляем средний рейтинг режиссёра
+    if director_avg_map is not None:
+        df['director_avg_rating'] = df['directors'].map(director_avg_map)
+        # Заполняем пропуски — средним по датасету
+        global_avg = df['averageRating'].mean()
+        df['director_avg_rating'] = df['director_avg_rating'].fillna(global_avg)
+    else:
+        # Если нет карты — создаём из текущего чанка (для первого чанка)
+        temp_avg = df.groupby('directors')['averageRating'].mean()
+        df['director_avg_rating'] = df['directors'].map(temp_avg).fillna(df['averageRating'].mean())
 
     return df

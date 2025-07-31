@@ -23,13 +23,18 @@ class MovieRatingPredictor:
         self.is_fitted = False
 
     def partial_fit(self, X, y):
-        # Убедимся, что X и y — числовые и без NaN
-        X = np.asarray(X, dtype=np.float32)
+        # ✅ Преобразуем sparse в плотный массив
+        if hasattr(X, 'toarray'):
+            X = X.toarray()  # csr_matrix -> numpy.ndarray
+        else:
+            X = np.asarray(X)
+
+        # Убедимся, что y — одномерный массив
         y = np.asarray(y, dtype=np.float32).ravel()
 
         # Заменяем NaN и inf
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        y = np.nan_to_num(y, nan=np.mean(y), posinf=np.median(y), neginf=np.median(y))
+        y = np.nan_to_num(y, nan=np.mean(y[y == y]), posinf=np.median(y), neginf=np.median(y))  # фильтруем NaN
 
         # Импутация
         X = self.imputer.fit_transform(X) if not self.is_fitted else self.imputer.transform(X)
@@ -48,13 +53,17 @@ class MovieRatingPredictor:
         if not self.is_fitted:
             raise RuntimeError("Model not trained.")
 
+        # ✅ Преобразуем sparse в dense
+        if hasattr(X, 'toarray'):
+            X = X.toarray()
+
         X = np.asarray(X, dtype=np.float32)
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         X = self.imputer.transform(X)
         X = self.scaler.transform(X)
 
         pred = self.model.predict(X)
-        return np.clip(pred, 1.0, 10.0)  # Ограничиваем от 1 до 10
+        return np.clip(pred, 1.0, 10.0)
 
     def save(self, path: str):
         joblib.dump(self, path)

@@ -4,6 +4,7 @@ import numpy as np
 import joblib
 import gc
 from tqdm import tqdm
+from scipy.sparse import hstack, csr_matrix
 
 # Внешние импорты вверху
 from app.data_loader import load_imdb_chunked
@@ -30,36 +31,36 @@ class Kinovanga:
         basics_path: str,
         ratings_path: str,
         crew_path: str,
-        chunksize: int = 10000,
+        chunksize: int = 5000,
         max_chunks: int = None,
         val_split: float = 0.2
     ):
         print("🚀 Начинаем обучение КиноВанги на чанках...")
 
-        total_lines = count_lines_gz(basics_path) - 1  # минус заголовок
+        total_lines = count_lines_gz(basics_path) - 1
         total_chunks = (total_lines + chunksize - 1) // chunksize
+        actual_max_chunks = max_chunks if max_chunks else total_chunks
 
         print(f"  • Размер чанка: {chunksize}")
         print(f"  • Всего данных: ~{total_lines:,} строк")
         print(f"  • Оценка чанков: ~{total_chunks}")
-        print(f"  • Максимум чанков: {max_chunks if max_chunks else f'все ({total_chunks})'}")
+        print(f"  • Максимум чанков: {actual_max_chunks}")
         print(f"  • Валидация: {val_split * 100:.0f}%")
 
         # --- 1. Подготовка векторизатора ---
         print("🧠 Обучаю TF-IDF векторизатор на первом чанке...")
         chunk_iter = load_imdb_chunked(basics_path, ratings_path, crew_path, chunksize)
         
-        # Только для TF-IDF
         first_chunk = next(chunk_iter)
         first_chunk = create_features(first_chunk)
-        
+
         if 'description' not in first_chunk.columns:
             raise KeyError("Колонка 'description' отсутствует. Проверьте create_features().")
         
         self.vectorizer = PlotVectorizer(max_features=100)
         self.vectorizer.fit_transform(first_chunk['description'])
 
-        # --- 2. Сбор статистики по режиссёрам и обучение ---
+        # --- 2. Сбор статистики и обучение ---
         print("📊 Собираем статистику и обучаем модель...")
         director_ratings = {}  # {director: [ratings]}
 
@@ -75,35 +76,70 @@ class Kinovanga:
         # Инициализация модели
         self.predictor = MovieRatingPredictor()
         val_history = []
-        total_chunks = 0
 
-        # Возвращаем первый чанк в поток обработки
-        chunks = [first_chunk] + list(chunk_iter)
+        # ✅ УБРАЛИ: chunks = [first_chunk] + [chunk for chunk in chunk_iter]
+        # Вместо этого — обрабатываем итератор напрямую
 
-        for chunk in chunks:
+        # --- Обработка первого чанка ---
+        update_director_stats(first_chunk)
+
+        director_avg_map = {k: np.mean(v) for k, v in director_ratings.items()}
+        df = create_features(first_chunk, director_avg_map=director_avg_map)
+        df = df.dropna(subset=['averageRating'])
+
+        X_text = self.vectorizer.transform(df['description'])
+        X_num = df[['startYear', 'runtimeMinutes', 'director_avg_rating', 'is_remake']].values
+
+        # ✅ Исправлено: преобразуем X_num в sparse
+        X_num_sparse = csr_matrix(X_num)
+        X = hstack([X_num_sparse, X_text])
+        X = X.tocsr()
+        y = df['averageRating'].values
+
+        split_idx = int(X.shape[0] * (1 - val_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+
+        self.predictor.partial_fit(X_train, y_train)
+
+        y_pred = self.predictor.predict(X_val)
+        mae = np.mean(np.abs(y_val - y_pred))
+        val_history.append(mae)
+        tqdm.write(f"Chunk 1 | MAE: {mae:.3f}")
+
+        del df, X, y, X_train, X_val, y_train, y_val
+        gc.collect()
+
+        # --- Основной цикл по оставшимся чанкам ---
+        total_chunks = 1
+
+        # ✅ Используем ТОТ ЖЕ итератор — он уже "пропустил" первый чанк
+        pbar = tqdm(total=actual_max_chunks, desc="📦 Чанки", initial=1, unit="chunk")
+
+        for chunk in chunk_iter:
             if max_chunks and total_chunks >= max_chunks:
                 break
 
-            # Обновляем статистику ПЕРЕД тем, как использовать director_avg
+            # Обновляем статистику
             update_director_stats(chunk)
 
-            # Создаём director_avg_map на основе текущей статистики
+            # Создаём актуальный director_avg_map
             director_avg_map = {k: np.mean(v) for k, v in director_ratings.items()}
 
-            # Один раз — создаём признаки с актуальной статистикой
+            # Один раз — признаки
             df = create_features(chunk, director_avg_map=director_avg_map)
-
-            # Пропускаем строки без рейтинга
             df = df.dropna(subset=['averageRating'])
 
-            X_text = self.vectorizer.transform(df['description'])
+            X_text = self.vectorizer.transform(df['description'])  # sparse
             X_num = df[['startYear', 'runtimeMinutes', 'director_avg_rating', 'is_remake']].values
-            X = np.hstack([X_num, X_text.toarray()])  # или использовать sparse
-            X = np.nan_to_num(X, nan=0.0)
+            X_num_sparse = csr_matrix(X_num)
+
+            # ✅ Исправлено: hstack + tocsr()
+            X = hstack([X_num_sparse, X_text]).tocsr()  # <-- Ключевое исправление
             y = df['averageRating'].values
 
-            # Валидация
-            split_idx = int(len(X) * (1 - val_split))
+            # Теперь можно индексировать
+            split_idx = int(X.shape[0] * (1 - val_split))
             X_train, X_val = X[:split_idx], X[split_idx:]
             y_train, y_val = y[:split_idx], y[split_idx:]
 
@@ -112,12 +148,15 @@ class Kinovanga:
             y_pred = self.predictor.predict(X_val)
             mae = np.mean(np.abs(y_val - y_pred))
             val_history.append(mae)
+            tqdm.write(f"Chunk {total_chunks + 1} | MAE: {mae:.3f}")
 
-            tqdm.write(f"Chunk {total_chunks + 1:2d} | MAE: {mae:.3f}")
             total_chunks += 1
+            pbar.update(1)
 
             del df, X, y, X_train, X_val, y_train, y_val
             gc.collect()
+
+        pbar.close()
 
         # Сохраняем финальные средние
         self.director_avg = {k: np.mean(v) for k, v in director_ratings.items()}

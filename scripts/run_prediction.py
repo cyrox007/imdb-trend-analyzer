@@ -16,7 +16,7 @@ kino.train_on_chunks(
     ratings_path=ratings_path,
     crew_path=crew_path,
     chunksize=10000,
-    max_chunks=20  # Увеличь, если хватает времени
+    max_chunks=None
 )
 
 # Сохраняем (опционально)

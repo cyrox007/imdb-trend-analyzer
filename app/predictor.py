@@ -31,6 +31,7 @@ class Kinovanga:
         basics_path: str,
         ratings_path: str,
         crew_path: str,
+        principals_path: str = None,
         chunksize: int = 5000,
         max_chunks: int = None,
         val_split: float = 0.2
@@ -49,16 +50,16 @@ class Kinovanga:
 
         # --- 1. Подготовка векторизатора ---
         print("🧠 Обучаю TF-IDF векторизатор на первом чанке...")
-        chunk_iter = load_imdb_chunked(basics_path, ratings_path, crew_path, chunksize)
-        
-        first_chunk = next(chunk_iter)
-        first_chunk = create_features(first_chunk)
+        chunk_iter = load_imdb_chunked(basics_path, ratings_path, crew_path, principals_path, chunksize)
 
-        if 'description' not in first_chunk.columns:
-            raise KeyError("Колонка 'description' отсутствует. Проверьте create_features().")
-        
+        first_chunk_basics, first_chunk_principals = next(chunk_iter)
+
+        # ✅ Не вызываем create_features здесь!
+        # У нас есть 'primaryTitle' — её и используем как description
+        desc_series = first_chunk_basics['primaryTitle'].fillna('')
+
         self.vectorizer = PlotVectorizer(max_features=100)
-        self.vectorizer.fit_transform(first_chunk['description'])
+        self.vectorizer.fit_transform(desc_series)
 
         # --- 2. Сбор статистики и обучение ---
         print("📊 Собираем статистику и обучаем модель...")
@@ -81,10 +82,10 @@ class Kinovanga:
         # Вместо этого — обрабатываем итератор напрямую
 
         # --- Обработка первого чанка ---
-        update_director_stats(first_chunk)
+        update_director_stats(first_chunk_basics)
 
         director_avg_map = {k: np.mean(v) for k, v in director_ratings.items()}
-        df = create_features(first_chunk, director_avg_map=director_avg_map)
+        df = create_features(first_chunk_basics, director_avg_map=director_avg_map)
         df = df.dropna(subset=['averageRating'])
 
         X_text = self.vectorizer.transform(df['description'])
@@ -116,19 +117,23 @@ class Kinovanga:
         # ✅ Используем ТОТ ЖЕ итератор — он уже "пропустил" первый чанк
         pbar = tqdm(total=actual_max_chunks, desc="📦 Чанки", initial=1, unit="chunk")
 
-        for chunk in chunk_iter:
+        for chunk, principals_chunk in chunk_iter:
             if max_chunks and total_chunks >= max_chunks:
                 break
 
-            # Обновляем статистику
             update_director_stats(chunk)
 
-            # Создаём актуальный director_avg_map
             director_avg_map = {k: np.mean(v) for k, v in director_ratings.items()}
+            df = create_features(chunk, director_avg_map=director_avg_map, principals_df=principals_chunk)
 
-            # Один раз — признаки
-            df = create_features(chunk, director_avg_map=director_avg_map)
+            if df.empty or len(df) == 0:
+                print(f"⚠️ Чанк {total_chunks + 1} пуст после обработки — пропускаем обучение")
+                continue
+            
             df = df.dropna(subset=['averageRating'])
+            if df.empty:
+                print(f"⚠️ Нет данных с рейтингом в чанке {total_chunks + 1} — пропускаем")
+                continue
 
             X_text = self.vectorizer.transform(df['description'])  # sparse
             X_num = df[['startYear', 'runtimeMinutes', 'director_avg_rating', 'is_remake']].values
